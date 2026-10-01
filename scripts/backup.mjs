@@ -2,10 +2,14 @@
 // Nightly backup for the GenID Protocol database and storage bucket.
 //
 // Produces, under backups/<YYYY-MM-DD>/ relative to the repo root:
-//   db.sql.gpg       - gpg-symmetric-encrypted plain-text pg_dump of the
-//                       whole public schema
-//   storage.tar.gpg  - gpg-symmetric-encrypted tar of every object in the
-//                       genid-sessions storage bucket
+//   db.sql.gpg                  - gpg-symmetric-encrypted plain-text pg_dump
+//                                  of the whole public schema
+//   storage.tar.gpg.part-aa, .part-ab, ... - the gpg-symmetric-encrypted tar
+//                                  of every object in the genid-sessions
+//                                  storage bucket, split into <100MB chunks
+//                                  (GitHub's hard per-file push limit). The
+//                                  unsplit .gpg file is never written under
+//                                  backups/ itself.
 //
 // Also deletes any backups/<YYYY-MM-DD>/ directory older than
 // RETENTION_DAYS (default 30), so the repo doesn't grow forever.
@@ -52,6 +56,22 @@ function gpgEncrypt(inputPath, outputPath, passphrase) {
     ['--batch', '--yes', '--passphrase', passphrase, '--symmetric', '--cipher-algo', 'AES256', '-o', outputPath, inputPath],
     { stdio: 'inherit' }
   )
+}
+
+// GitHub hard-rejects any pushed file over 100MB ("GH001: Large files
+// detected"). Chunking at 90MB leaves headroom for gpg's small framing
+// overhead and any future storage growth before the next chunk boundary
+// drifts. Suffix length 2 matches split's own default and is what the
+// workflow/restore script expect (storage.tar.gpg.part-aa, -ab, ...).
+const SPLIT_CHUNK_SIZE = '90m'
+
+function splitFile(inputPath, outDir, baseName) {
+  // Default alphabetic suffixes (-aa, -ab, ...) — matches split's own
+  // default behavior, which is what scripts/restore.mjs's sort-and-
+  // concatenate step relies on.
+  execFileSync('split', ['-b', SPLIT_CHUNK_SIZE, '-a', '2', inputPath, path.join(outDir, `${baseName}.part-`)], {
+    stdio: 'inherit',
+  })
 }
 
 // ---- Database ----
@@ -165,10 +185,19 @@ async function main() {
 
   console.log('Encrypting...')
   gpgEncrypt(dbSqlPath, path.join(outDir, 'db.sql.gpg'), encryptionKey)
-  gpgEncrypt(storageTarPath, path.join(outDir, 'storage.tar.gpg'), encryptionKey)
+  const storageGpgTmpPath = path.join(tmpDir, 'storage.tar.gpg')
+  gpgEncrypt(storageTarPath, storageGpgTmpPath, encryptionKey)
 
-  // Clean up plaintext immediately — nothing unencrypted should linger on
-  // disk any longer than it takes to encrypt it.
+  // Split the encrypted storage archive into <100MB chunks before it ever
+  // lands under backups/ — GitHub hard-rejects pushes containing a file
+  // over 100MB. The unsplit storage.tar.gpg only ever exists in tmpDir,
+  // which gets wiped below; it's never committed.
+  console.log(`Splitting encrypted storage archive (${fs.statSync(storageGpgTmpPath).size} bytes)...`)
+  splitFile(storageGpgTmpPath, outDir, 'storage.tar.gpg')
+
+  // Clean up plaintext (and the unsplit encrypted storage archive)
+  // immediately — nothing that isn't a final committed artifact should
+  // linger on disk any longer than it takes to produce the split chunks.
   fs.rmSync(tmpDir, { recursive: true, force: true })
 
   pruneOldBackups(BACKUPS_DIR, RETENTION_DAYS)

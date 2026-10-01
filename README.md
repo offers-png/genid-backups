@@ -13,18 +13,23 @@ A GitHub Actions workflow ([`.github/workflows/nightly-backup.yml`](.github/work
 1. **Database** — a full `pg_dump` of the public schema (plain SQL, via the direct Postgres connection, not the REST API).
 2. **Storage** — every object in the `genid-sessions` bucket (step images, archived copies, certificate PDFs, C2PA exports), downloaded via the service-role key and packed into a tarball.
 
-Both are encrypted with `gpg --symmetric` (AES-256) before anything touches disk in this repo, then committed to:
+Both are encrypted with `gpg --symmetric` (AES-256) before anything touches disk in this repo. The database dump is small enough (currently ~15MB) to commit as a single file. The storage archive is not — GitHub hard-rejects any pushed file over 100MB (`GH001: Large files detected`), and the encrypted storage tarball has already crossed that — so it's split into ~90MB chunks (`split -b 90m`) before committing, named with the default alphabetic suffixes:
 
 ```
 backups/
   2026-10-01/
     db.sql.gpg
-    storage.tar.gpg
+    storage.tar.gpg.part-aa
+    storage.tar.gpg.part-ab
+    storage.tar.gpg.part-ac
   2026-10-02/
     db.sql.gpg
-    storage.tar.gpg
+    storage.tar.gpg.part-aa
+    storage.tar.gpg.part-ab
   ...
 ```
+
+The number of `.part-*` chunks varies run to run with how much is in the bucket — there's no fixed count. The unsplit `storage.tar.gpg` is never written into `backups/` or committed; it only ever exists briefly in a temp directory during the backup run. `scripts/restore.mjs` reassembles the chunks back into one file automatically (see [Restoring a backup](#restoring-a-backup)) — you never need to do this by hand.
 
 **Retention: 30 days.** Each run also deletes any `backups/<date>/` directory older than 30 days, so this repo's history doesn't grow forever. If you need to keep a specific backup longer than that, copy its folder out before it ages out, or clone the repo at the right historical commit (git history itself isn't pruned, only the working tree — see [Keeping a backup past 30 days](#keeping-a-backup-past-30-days)).
 
@@ -48,9 +53,9 @@ Until these are set, the nightly workflow will run and fail immediately (missing
 
 ## How the pipeline works
 
-- [`scripts/backup.mjs`](scripts/backup.mjs) — does the actual work: `pg_dump`, list + download every storage object, `tar`, `gpg --symmetric` both artifacts, write them to `backups/<today>/`, delete anything older than 30 days. Never commits or pushes anything itself — pure file I/O against the local checkout.
-- [`.github/workflows/nightly-backup.yml`](.github/workflows/nightly-backup.yml) — installs `postgresql-client` (for `pg_dump`) and Node, runs the script above with the four secrets as env vars, then commits and pushes `backups/` if anything changed.
-- [`scripts/restore.mjs`](scripts/restore.mjs) — the inverse: decrypts a given date's `db.sql.gpg` and `storage.tar.gpg` into a local `restored-<date>/` directory. It deliberately stops there and never applies the SQL to any database itself — see below for why that's a separate, manual step.
+- [`scripts/backup.mjs`](scripts/backup.mjs) — does the actual work: `pg_dump`, list + download every storage object, `tar`, `gpg --symmetric` both artifacts, split the encrypted storage archive into `.part-*` chunks, write everything to `backups/<today>/`, delete anything older than 30 days. Never commits or pushes anything itself — pure file I/O against the local checkout.
+- [`.github/workflows/nightly-backup.yml`](.github/workflows/nightly-backup.yml) — installs PostgreSQL client 17 (matching Supabase's server version, for `pg_dump`) and Node, runs the script above with the four secrets as env vars, then commits and pushes `backups/` if anything changed.
+- [`scripts/restore.mjs`](scripts/restore.mjs) — the inverse: reassembles a given date's `storage.tar.gpg.part-*` chunks (falling back to a plain `storage.tar.gpg` for any pre-chunking backup), then decrypts that alongside `db.sql.gpg` into a local `restored-<date>/` directory. It deliberately stops there and never applies the SQL to any database itself — see below for why that's a separate, manual step.
 
 ## Restoring a backup
 
@@ -81,13 +86,19 @@ restored-2026-10-01/
       ...
 ```
 
+Under the hood, `restore.mjs` first concatenates that date's `storage.tar.gpg.part-aa`, `.part-ab`, ... chunks (sorted) back into one encrypted file before decrypting — you don't need to do this yourself. (If a backup predates chunking and only has a plain `storage.tar.gpg`, it decrypts that directly instead.)
+
 **Both are plaintext and contain real user data.** Don't commit them anywhere, and delete the `restored-<date>/` directory as soon as you're done (the script reminds you of this at the end, and prints the exact `rm -rf` command).
 
-If you don't have Node available, the two decrypt steps are just:
+If you don't have Node available, the equivalent manual steps are:
 
 ```bash
 gpg --batch --passphrase "$BACKUP_ENCRYPTION_KEY" --decrypt -o db.sql backups/2026-10-01/db.sql.gpg
-gpg --batch --passphrase "$BACKUP_ENCRYPTION_KEY" --decrypt -o storage.tar backups/2026-10-01/storage.tar.gpg
+
+# Reassemble the storage chunks (there may be one or several, depending on
+# how much was in the bucket that night), then decrypt the result:
+cat backups/2026-10-01/storage.tar.gpg.part-* > storage.tar.gpg
+gpg --batch --passphrase "$BACKUP_ENCRYPTION_KEY" --decrypt -o storage.tar storage.tar.gpg
 mkdir storage && tar -xf storage.tar -C storage
 ```
 
@@ -130,7 +141,13 @@ Before this pipeline went live, the full restore path was validated against **re
 
 Separately, `scripts/restore.mjs` itself (the actual script in this repo, not a manual re-implementation of its steps) was run end-to-end against a synthetic backup pair to confirm the script's own decrypt/extract logic produces byte-identical output — including a sample file opening correctly after decryption.
 
-What this means in practice: the **encrypt → decrypt → restore → verify** mechanism is proven correct against this project's real schema and real data. The one thing that could only be exercised for real once secrets are configured is pulling genuinely live data through the actual nightly GitHub Actions run (`pg_dump` against the real direct connection, real storage downloads with the real service-role key) — that will happen on the first real scheduled or manually-triggered run after secrets are set.
+**Split-chunk storage archives.** When the real nightly run's encrypted storage tarball first crossed GitHub's 100MB per-file push limit, `scripts/backup.mjs` was changed to split it into `.part-*` chunks and `scripts/restore.mjs` to reassemble them. That round trip was verified the same way, against the real scripts:
+1. A synthetic storage tree (including a multi-megabyte binary file, to rule out a text-only false pass) was tarred and gpg-encrypted, then split into 6 chunks with the same `split -b <size> -a 2` invocation `backup.mjs` uses.
+2. The real `scripts/restore.mjs` — unmodified, run exactly as the nightly workflow or a human would run it — was pointed at that chunked backup. It correctly detected all 6 `.part-*` files, reassembled them in order, decrypted the result, and extracted the tar.
+3. The restored tree was byte-for-byte identical to the original (`diff -r`, plus a SHA-256 match on the binary file), and the intermediate reassembled `.gpg` file was cleaned up afterward, exactly as the script's own logic is supposed to do.
+4. The backward-compatibility fallback was verified separately: a legacy, unsplit `storage.tar.gpg` with no `.part-*` siblings was restored by the same script and decrypted/extracted correctly without alteration.
+
+What this means in practice: the **encrypt → decrypt → restore → verify** mechanism is proven correct against this project's real schema and real data, and the **split → reassemble → decrypt** mechanism is proven correct against synthetic data standing in for a real oversized storage archive. The one thing that could only be exercised for real once secrets are configured is pulling genuinely live data through the actual nightly GitHub Actions run (`pg_dump` against the real direct connection, real storage downloads with the real service-role key, the real chunk count and sizes that come out of that) — that happens on each real scheduled or manually-triggered run.
 
 ## Keeping a backup past 30 days
 
