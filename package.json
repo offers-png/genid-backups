@@ -1,0 +1,17 @@
+{
+  "name": "genid-backups",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Nightly encrypted backups of the GenID Protocol database and storage bucket.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "backup": "node scripts/backup.mjs",
+    "restore": "node scripts/restore.mjs"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.105.1"
+  }
+}

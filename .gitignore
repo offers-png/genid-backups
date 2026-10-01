@@ -1,0 +1,7 @@
+node_modules/
+restored-*/
+*.sql
+*.tar
+!backups/**/*.gpg
+.env
+.env.local
